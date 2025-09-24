@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+# drone_gps_with_roboflow_commented.py
+# Fully commented Raspberry Pi drone program that:
+#  - reads NMEA GPS from a GPS module
+#  - captures a camera frame and sends it to Roboflow hosted model for "stagnant water" detection
+#  - packages GPS + flags (water-detected) into a compact binary frame
+#  - sends the frame reliably over a serial radio link (HC-12) with ACK/NACK + retries
+#  - provides an interactive CLI and an automatic periodic sender
+
+# -------- standard library imports --------
+import sys                                   # access to system exit and args
+import time                                  # sleep and timestamps
+import threading                             # run concurrent threads
+import struct                                # pack/unpack binary data for payloads
+from collections import deque                 # thread-friendly-ish queue for incoming frames
+import argparse                              # parse command-line arguments
+import os                                    # access environment variables (for API keys)
+
+# -------- external library imports --------
+import serial                                # pyserial for serial comms (radio, GPS)
+import cv2                                   # OpenCV for camera capture
+import requests                              # simple HTTP client for Roboflow hosted inference
+
+# -------- configuration constants --------
+# serial / radio
+SERIAL_PORT = "/dev/serial0"               # default radio serial (Pi UART)
+BAUDRATE = 9600                              # radio baud
+
+# gps
+GPS_PORT = "/dev/ttyUSB0"                  # default GPS serial (USB-serial)
+GPS_BAUD = 9600                              # GPS baud
+
+# framing bytes and types
+START_BYTE = 0x7E                            # frame start marker
+END_BYTE = 0x7F                              # frame end marker
+TYPE_ACK = 0x06                              # ACK frame type
+TYPE_NACK = 0x15                             # NACK frame type
+TYPE_GPS = 0x40                              # GPS frame type identifier
+
+# flags
+FLAG_WATER = 0x01                            # bit0 indicates stagnant-water detected
+
+# timeouts and retries
+READ_TIMEOUT = 0.1                           # serial read timeout (s)
+ACK_TIMEOUT = 1.0                            # wait for ACK timeout (s)
+RETRIES = 3                                  # number of send retries
+AUTO_SEND_INTERVAL = 1.0                     # seconds between auto-sends
+
+# Roboflow config - recommended to set via environment variable
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "REPLACE_WITH_YOUR_KEY")
+ROBOFLOW_MODEL_URL = os.environ.get("ROBOFLOW_MODEL_URL", "https://detect.roboflow.com/your-model/1")
+ROBOFLOW_CONF_THRESHOLD = 0.5                # detection threshold to consider positive
+
+# camera settings
+CAM_INDEX = 0                                # camera index (0 = first camera)
+CAM_WIDTH = 640                              # capture width
+CAM_HEIGHT = 480                             # capture height
+
+# -------- shared runtime state --------
+incoming_queue = deque()                     # parsed incoming frames from radio
+running = True                                # global flag to let threads exit cleanly
+
+# GPS latest fix storage and lock
+gps_lock = threading.Lock()                   # protect latest_fix
+latest_fix = {
+    "valid": False,
+    "lat": 0.0,
+    "lon": 0.0,
+    "alt": 0.0,
+    "timestamp": 0.0
+}
+
+# sequence id counter and lock
+seq_id_counter = 1
+seq_lock = threading.Lock()
+
+def next_seq_id():
+    """Return a one-byte sequence id (0..255), thread-safe."""
+    global seq_id_counter
+    with seq_lock:
+        val = seq_id_counter & 0xFF
+        seq_id_counter = (seq_id_counter + 1) & 0xFF
+    return val
+
+# -------- framing and checksum helpers --------
+
+def xor_checksum(type_byte: int, payload: bytes) -> int:
+    """Compute XOR checksum over type byte and payload bytes. Returns single byte int."""
+    chk = type_byte & 0xFF
+    for b in payload:
+        chk ^= b
+    return chk & 0xFF
+
+
+def build_frame(type_byte: int, payload: bytes) -> bytes:
+    """Construct full frame bytes: START LEN TYPE PAYLOAD CHK END"""
+    length = 1 + len(payload)  # type byte + payload length
+    chk = xor_checksum(type_byte, payload)
+    return bytes([START_BYTE, length, type_byte]) + payload + bytes([chk, END_BYTE])
+
+
+def parse_stream(buffer: bytearray):
+    """Try to parse one frame from buffer. If a frame is found, remove it and return (type, payload).
+    If incomplete, return None. If bad checksum found, return ("BAD_CHK", b"")."""
+    # drop bytes until start marker
+    while buffer and buffer[0] != START_BYTE:
+        buffer.pop(0)
+    # need minimum 5 bytes to even consider a frame
+    if len(buffer) < 5:
+        return None
+    length = buffer[1]
+    total_len = 1 + 1 + length + 1 + 1  # start + len + (type+payload) + chk + end
+    if len(buffer) < total_len:
+        return None
+    # check end marker
+    if buffer[total_len - 1] != END_BYTE:
+        # corrupt framing: drop first byte and try again
+        buffer.pop(0)
+        return None
+    type_byte = buffer[2]
+    payload_len = length - 1
+    payload = bytes(buffer[3:3 + payload_len])
+    chk = buffer[3 + payload_len]
+    if chk != xor_checksum(type_byte, payload):
+        # bad checksum: remove entire tentative frame and report bad chk
+        del buffer[:total_len]
+        return ("BAD_CHK", b"")
+    # success: remove bytes and return parsed frame
+    del buffer[:total_len]
+    return (type_byte, payload)
+
+# -------- serial reader thread for radio --------
+
+def serial_reader_thread(ser):
+    """Continuously read bytes from serial 'ser', parse frames, and push parsed frames to incoming_queue."""
+    buf = bytearray()
+    global running
+    while running:
+        try:
+            chunk = ser.read(256)  # read up to 256 bytes (timeout set on serial)
+            if chunk:
+                buf.extend(chunk)
+                while True:
+                    parsed = parse_stream(buf)
+                    if not parsed:
+                        break
+                    incoming_queue.append(parsed)
+            else:
+                time.sleep(READ_TIMEOUT)
+        except Exception as e:
+            print("[SERIAL] read error:", e)
+            time.sleep(0.5)
+
+# -------- ACK wait and reliable send helpers --------
+
+def wait_for_ack(expected_seq=None, timeout=ACK_TIMEOUT):
+    """Wait up to 'timeout' seconds for an ACK with optional expected_seq in payload[0].
+    Returns True for ACK, False for NACK or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        while incoming_queue:
+            t, payload = incoming_queue.popleft()
+            if t == TYPE_ACK:
+                # if expected_seq given, check first payload byte
+                if expected_seq is None:
+                    return True
+                if payload and payload[0] == expected_seq:
+                    return True
+            elif t == TYPE_NACK:
+                return False
+            elif t == "BAD_CHK":
+                # ignore and continue waiting
+                continue
+            else:
+                # other types: push them back and allow caller to handle later
+                incoming_queue.append((t, payload))
+                time.sleep(0.01)
+        time.sleep(0.01)
+    return False
+
+
+def send_with_ack(ser, type_byte: int, payload: bytes, retries=RETRIES, timeout=ACK_TIMEOUT):
+    """Send framed message and wait for ACK; retry on timeout. Returns True if ACK received."""
+    frame = build_frame(type_byte, payload)
+    for attempt in range(retries):
+        try:
+            ser.write(frame)
+            ser.flush()
+        except Exception as e:
+            print("[SERIAL] write error:", e)
+            return False
+        print(f"[TX] attempt {attempt+1}/{retries} type=0x{type_byte:02X} payload={payload.hex()}")
+        ok = wait_for_ack(expected_seq=payload[0] if payload else None, timeout=timeout)
+        if ok:
+            print("[TX] ACK received")
+            return True
+        else:
+            print("[TX] no ACK")
+    return False
+
+# -------- simple NMEA to decimal converter --------
+
+def nmea_to_decimal(coord_str, hemi):
+    """Convert NMEA coordinate string (ddmm.mmmm or dddmm.mmmm) + hemisphere letter to decimal degrees."""
+    if not coord_str or '.' not in coord_str:
+        return None
+    # decide degree length heuristically (lat uses 2, lon uses 3)
+    main_part = coord_str.split('.')[0]
+    deg_len = 2 if len(main_part) in (4, 5) else 3 if len(main_part) >= 5 else 2
+    try:
+        deg = float(coord_str[0:deg_len])
+        minutes = float(coord_str[deg_len:])
+    except Exception:
+        return None
+    dec = deg + minutes / 60.0
+    if hemi in ('S', 'W'):
+        dec = -dec
+    return dec
+
+# -------- GPS reader thread that updates latest_fix --------
+
+def gps_reader_thread(gps_port, gps_baud):
+    """Read NMEA lines from GPS port and update latest_fix dict when valid GGA or RMC sentences arrive."""
+    try:
+        gps_ser = serial.Serial(gps_port, gps_baud, timeout=1.0)
+    except Exception as e:
+        print("[GPS] failed to open port:", e)
+        return
+    print(f"[GPS] reader started on {gps_port} @ {gps_baud}bps")
+    global running
+    while running:
+        try:
+            line = gps_ser.readline().decode('ascii', errors='ignore').strip()
+            if not line or not line.startswith('$'):
+                continue
+            parts = line.split(',')
+            if parts[0].endswith('GGA'):
+                # GGA contains fix quality and altitude
+                fix = parts[6] if len(parts) > 6 else '0'
+                if fix == '0':
+                    continue
+                lat = nmea_to_decimal(parts[2], parts[3]) if len(parts) > 3 else None
+                lon = nmea_to_decimal(parts[4], parts[5]) if len(parts) > 5 else None
+                alt = float(parts[9]) if len(parts) > 9 and parts[9] != '' else 0.0
+                if lat is not None and lon is not None:
+                    with gps_lock:
+                        latest_fix.update({
+                            'valid': True,
+                            'lat': lat,
+                            'lon': lon,
+                            'alt': alt,
+                            'timestamp': time.time()
+                        })
+            elif parts[0].endswith('RMC'):
+                # RMC provides status (A=valid) and lat/lon
+                status = parts[2] if len(parts) > 2 else 'V'
+                if status != 'A':
+                    continue
+                lat = nmea_to_decimal(parts[3], parts[4]) if len(parts) > 4 else None
+                lon = nmea_to_decimal(parts[5], parts[6]) if len(parts) > 6 else None
+                if lat is not None and lon is not None:
+                    with gps_lock:
+                        latest_fix.update({
+                            'valid': True,
+                            'lat': lat,
+                            'lon': lon,
+                            'alt': latest_fix.get('alt', 0.0),
+                            'timestamp': time.time()
+                        })
+        except Exception as e:
+            # don't crash the thread on transient errors
+            #print('[GPS] read error:', e)
+            time.sleep(0.2)
+    try:
+        gps_ser.close()
+    except Exception:
+        pass
+
+# -------- camera capture helper --------
+
+def capture_frame_bytes(cam_index=CAM_INDEX, width=CAM_WIDTH, height=CAM_HEIGHT):
+    """Open the camera, capture a single frame, encode to JPEG bytes, and return bytes or None."""
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        print('[CAM] camera open failed')
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        print('[CAM] frame capture failed')
+        return None
+    ok, buf = cv2.imencode('.jpg', frame)
+    if not ok:
+        return None
+    return buf.tobytes()
+
+# -------- Roboflow hosted inference helper (HTTP multipart) --------
+
+def roboflow_detect_image_jpeg(image_bytes):
+    """Send JPEG bytes to Roboflow hosted detection endpoint and return list of predictions.
+    Predictions are expected in the 'predictions' field of the JSON response."""
+    if not ROBOFLOW_API_KEY or 'REPLACE_WITH' in ROBOFLOW_API_KEY:
+        print('[RF] Roboflow API key not set in ROBOFLOW_API_KEY environment variable')
+        return []
+    try:
+        files = {'file': ('frame.jpg', image_bytes, 'image/jpeg')}
+        params = {'api_key': ROBOFLOW_API_KEY}
+        resp = requests.post(ROBOFLOW_MODEL_URL, params=params, files=files, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        preds = j.get('predictions', []) if isinstance(j, dict) else []
+        return preds
+    except Exception as e:
+        print('[RF] inference error:', e)
+        return []
+
+# -------- payload builder with flags (updated format) --------
+
+def build_gps_payload_with_flags(seq_id: int, flags: int, lat_deg: float, lon_deg: float, alt_m: float) -> bytes:
+    """Pack payload as: [SEQ (1)] [FLAGS (1)] [LAT 4b signed] [LON 4b signed] [ALT 2b unsigned]
+    big-endian/network order. Total = 12 bytes."""
+    lat_mcdeg = int(round(lat_deg * 1_000_000))
+    lon_mcdeg = int(round(lon_deg * 1_000_000))
+    alt_int = int(round(alt_m)) & 0xFFFF
+    # '>BBiiH' = big-endian, 1-byte unsigned, 1-byte unsigned, 4-byte signed, 4-byte signed, 2-byte unsigned
+    return struct.pack('>BBiiH', seq_id & 0xFF, flags & 0xFF, lat_mcdeg, lon_mcdeg, alt_int)
+
+# -------- function that sends current GPS with water detection integrated --------
+
+def send_current_gps_with_water_flag(ser):
+    """Capture camera frame, run Roboflow detection, set flags, build payload, and send with ack."""
+    # read latest GPS under lock
+    with gps_lock:
+        fix = dict(latest_fix)
+    if not fix.get('valid'):
+        print('[SEND] No valid GPS fix to send')
+        return False
+
+    # capture a frame from camera
+    img = capture_frame_bytes()
+    water_flag = 0
+    if img:
+        preds = roboflow_detect_image_jpeg(img)
+        for p in preds:
+            # Roboflow prediction dict typically contains 'class' or 'label' and 'confidence' (or 'score')
+            cls = p.get('class') or p.get('label') or ''
+            conf = float(p.get('confidence', p.get('score', 0.0)))
+            if ('water' in cls.lower() or 'stagnant' in cls.lower()) and conf >= ROBOFLOW_CONF_THRESHOLD:
+                water_flag = FLAG_WATER
+                print(f"[RF] Water detected conf={conf:.2f} class={cls}")
+                break
+
+    sid = next_seq_id()
+    payload = build_gps_payload_with_flags(sid, water_flag, fix['lat'], fix['lon'], fix['alt'])
+    ok = send_with_ack(ser, TYPE_GPS, payload)
+    return ok
+
+# -------- incoming message handler for non-ACK messages --------
+
+def incoming_handler_loop():
+    """Simple consumer that prints non-ACK/NACK messages (e.g., telemetry) for debugging."""
+    global running
+    while running:
+        while incoming_queue:
+            t, payload = incoming_queue.popleft()
+            if t == TYPE_ACK or t == TYPE_NACK:
+                continue
+            if t == 'BAD_CHK':
+                print('[RX] Bad checksum frame dropped')
+                continue
+            try:
+                txt = payload.decode('ascii')
+                print(f"[RX] Type=0x{t:02X} ASCII='{txt}'")
+            except Exception:
+                print(f"[RX] Type=0x{t:02X} PAYLOAD={payload.hex()}")
+        time.sleep(0.05)
+
+# -------- auto-send loop that uses the water detection send function --------
+
+auto_send_flag = threading.Event()
+
+def auto_send_loop(ser, interval=AUTO_SEND_INTERVAL):
+    """Periodically send GPS (with water detection) while auto_send_flag is set."""
+    global running
+    while running:
+        if auto_send_flag.is_set():
+            ok = send_current_gps_with_water_flag(ser)
+            if not ok:
+                print('[AUTO] GPS send failed after retries')
+        time.sleep(interval)
+
+# -------- interactive CLI (uses send_current_gps_with_water_flag) --------
+
+def interactive_cli(ser):
+    """Simple CLI to control sending and view status."""
+    print("Commands: 'help','quit','send','auto on','auto off','status','raw <hex>'")
+    while True:
+        try:
+            line = input('> ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        parts = line.split()
+        cmd = parts[0].lower()
+        if cmd in ('quit', 'exit'):
+            break
+        if cmd == 'help':
+            print("help    - show this")
+            print("send    - send one GPS update now (runs camera detection)")
+            print("auto on - start periodic GPS+detection sends")
+            print("auto off- stop periodic sends")
+            print("status  - show latest GPS fix")
+            print("raw <hex> - send raw payload as TYPE_GPS (first byte is seq id)")
+            print("quit    - exit program")
+            continue
+        if cmd == 'status':
+            with gps_lock:
+                if latest_fix['valid']:
+                    print(f"GPS fix: lat={latest_fix['lat']:.6f} lon={latest_fix['lon']:.6f} alt={latest_fix['alt']} time={time.ctime(latest_fix['timestamp'])}")
+                else:
+                    print('No valid GPS fix yet')
+            continue
+        if cmd == 'auto' and len(parts) > 1:
+            if parts[1].lower() == 'on':
+                auto_send_flag.set()
+                print('Auto-send ON')
+            else:
+                auto_send_flag.clear()
+                print('Auto-send OFF')
+            continue
+        if cmd == 'send':
+            ok = send_current_gps_with_water_flag(ser)
+            print('send result:', ok)
+            continue
+        if cmd == 'raw' and len(parts) > 1:
+            try:
+                raw = bytes.fromhex(parts[1])
+                ok = send_with_ack(ser, TYPE_GPS, raw)
+                print('raw send result:', ok)
+            except Exception as e:
+                print('Invalid hex:', e)
+            continue
+        print("Unknown command. Type 'help'.")
+
+# -------- main -- initialize serial, threads and CLI --------
+
+def main():
+    parser = argparse.ArgumentParser(description='Drone GPS + Roboflow detection sender')
+    parser.add_argument('--radio', default=SERIAL_PORT, help='serial port to radio (HC-12)')
+    parser.add_argument('--radbaud', default=BAUDRATE, type=int)
+    parser.add_argument('--gps', default=GPS_PORT, help='gps serial device')
+    parser.add_argument('--gpsbaud', default=GPS_BAUD, type=int)
+    args = parser.parse_args()
+
+    try:
+        ser = serial.Serial(args.radio, args.radbaud, timeout=READ_TIMEOUT)
+    except Exception as e:
+        print('[MAIN] Failed to open radio serial port:', e)
+        sys.exit(1)
+
+    # start background threads
+    reader = threading.Thread(target=serial_reader_thread, args=(ser,), daemon=True)
+    reader.start()
+
+    handler = threading.Thread(target=incoming_handler_loop, daemon=True)
+    handler.start()
+
+    gps_thread = threading.Thread(target=gps_reader_thread, args=(args.gps, args.gpsbaud), daemon=True)
+    gps_thread.start()
+
+    auto_thread = threading.Thread(target=auto_send_loop, args=(ser,), daemon=True)
+    auto_thread.start()
+
+    try:
+        interactive_cli(ser)
+    finally:
+        global running
+        running = False
+        time.sleep(0.2)
+        try:
+            ser.close()
+        except Exception:
+            pass
+        print('Exiting.')
+
+if __name__ == '__main__':
+    main()
