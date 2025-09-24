@@ -1,0 +1,314 @@
+// rover_firmware_with_radio_ack.cpp
+// Improved rover firmware with:
+//  - HC-12 message framing + XOR checksum + ACK/NACK
+//  - SoftwareSerial usage for GPS & HC-12 (matches original hardware pin choices)
+//  - No Arduino String usage (uses fixed char buffers)
+//  - State resets, timeouts and retry handling
+//  - Periodic logs and telemetry sent over Serial and radio
+//
+// NOTE: This sketch uses SoftwareSerial for both GPS and HC-12 to match
+// your original wiring (GPS on pins 2/3, HC-12 on pins 4/8). SoftwareSerial
+// can only reliably listen on one port at a time on AVR-based Arduinos.
+// If you observe lost bytes, consider moving one device to a hardware UART
+// (e.g., use a Mega) or use AltSoftSerial for one of the links.
+
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+#include <math.h>
+
+// ====== SoftwareSerial instances (match original wiring) ======
+SoftwareSerial gpsSS(2, 3);      // GPS on pins 2=RX, 3=TX
+SoftwareSerial radio(4, 8);      // HC-12 on pins 4=RX, 8=TX
+
+// ====== Includes & objects ======
+TinyGPSPlus gps;
+
+// ====== Pins ======
+const int PUMP_FRONT_PIN = 6;     // Relay for front pump
+const int PUMP_BACK_PIN  = 7;     // Relay for back pump
+const int COLLECT_DONE_PIN = 5;   // Input from Pi (HIGH = done)
+const int MOTOR_L_FWD = 9;        // Motor driver pins (ensure PWM)
+const int MOTOR_L_REV = 10;
+const int MOTOR_R_FWD = 11;
+const int MOTOR_R_REV = 12;
+
+// ====== Parameters & timeouts ======
+const double ARRIVE_RADIUS_M = 2.0;
+const unsigned long FRONT_PUMP_TIMEOUT_MS = 20000UL;
+const unsigned long BACK_PUMP_DRIVE_MS   = 8000UL;
+const unsigned long GOTO_TIMEOUT_MS = 5 * 60 * 1000UL; // 5 minutes
+const unsigned long TELEMETRY_MS = 5000UL; // telemetry every 5s
+const unsigned long RADIO_MESSAGE_MAXLEN = 120;
+const int DRIVE_PWM = 150;
+const int TURN_PWM  = 140;
+const int MAX_RETRIES = 2; // after timeouts retry or request resend
+
+// ====== State machine ======
+enum State { IDLE, GOTO, ARRIVED, COLLECT_FRONT, FORWARD_WITH_BACK_PUMP, DONE };
+State state = IDLE;
+
+// mission/target bookkeeping
+double targetLat = 0.0, targetLon = 0.0;
+long targetId = -1;
+bool hasTarget = false;
+unsigned long stateStart = 0;
+int retryCount = 0;
+
+// GPS / telemetry bookkeeping
+unsigned long lastTelemetrySent = 0;
+
+// radio receive buffer
+char radioBuf[128];
+size_t radioIdx = 0;
+
+// ====== Utility: math & geodesy ======
+static double toRad(double d){ return d * M_PI / 180.0; }
+static double toDeg(double r){ return r * 180.0 / M_PI; }
+
+double haversine_m(double lat1, double lon1, double lat2, double lon2){
+  double dLat = toRad(lat2 - lat1);
+  double dLon = toRad(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) +
+             cos(toRad(lat1))*cos(toRad(lat2))*sin(dLon/2)*sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return 6371000.0 * c;
+}
+
+double bearing_deg(double lat1, double lon1, double lat2, double lon2) {
+  double dLon = toRad(lon2 - lon1);
+  double y = sin(dLon) * cos(toRad(lat2));
+  double x = cos(toRad(lat1))*sin(toRad(lat2)) - sin(toRad(lat1))*cos(toRad(lat2))*cos(dLon);
+  return fmod(toDeg(atan2(y, x)) + 360.0, 360.0);
+}
+
+// ====== Hardware helpers ======
+void drive_stop(){
+  analogWrite(MOTOR_L_FWD, 0); analogWrite(MOTOR_L_REV, 0);
+  analogWrite(MOTOR_R_FWD, 0); analogWrite(MOTOR_R_REV, 0);
+}
+void drive_forward(int pwm = DRIVE_PWM){
+  analogWrite(MOTOR_L_FWD, pwm); analogWrite(MOTOR_L_REV, 0);
+  analogWrite(MOTOR_R_FWD, pwm); analogWrite(MOTOR_R_REV, 0);
+}
+
+void pump_front(bool on){ digitalWrite(PUMP_FRONT_PIN, on ? HIGH : LOW); }
+void pump_back (bool on){ digitalWrite(PUMP_BACK_PIN,  on ? HIGH : LOW);  }
+
+// ====== Checksum helpers ======
+uint8_t xor_checksum(const char *buf, size_t len){
+  uint8_t chk = 0;
+  for (size_t i=0;i<len;i++) chk ^= (uint8_t)buf[i];
+  return chk;
+}
+
+int hex2byte(char h){
+  if (h >= '0' && h <= '9') return h - '0';
+  if (h >= 'A' && h <= 'F') return 10 + (h - 'A');
+  if (h >= 'a' && h <= 'f') return 10 + (h - 'a');
+  return -1;
+}
+
+void radioSendFramed(const char *payload){
+  char frame[RADIO_MESSAGE_MAXLEN];
+  size_t n = snprintf(frame, sizeof(frame), "%s", payload);
+  if (n >= sizeof(frame)-5) return;
+  uint8_t chk = xor_checksum(frame, n);
+  char hex[6];
+  snprintf(hex, sizeof(hex), "#%02X\n", chk);
+  strncat(frame, hex, sizeof(frame)-strlen(frame)-1);
+  radio.print(frame);
+  Serial.print(F("[RADIO TX] "));
+  Serial.print(frame);
+}
+
+bool parseGeoPayload(const char *payload, double &lat, double &lon, long &id){
+  if (strncmp(payload, "GEO,", 4) != 0) return false;
+  char tmp[80];
+  strncpy(tmp, payload+4, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+  char *p1 = strchr(tmp, ',');
+  if (!p1) return false; *p1 = '\0';
+  char *p2 = strchr(p1+1, ',');
+  if (!p2) return false; *p2 = '\0';
+  lat = strtod(tmp, nullptr);
+  lon = strtod(p1+1, nullptr);
+  id = strtol(p2+1, nullptr, 10);
+  return true;
+}
+
+void readRadio(){
+  while (radio.available()){
+    char c = radio.read();
+    if (c == '\r') continue;
+    if (c == '\n'){
+      if (radioIdx == 0) continue;
+      radioBuf[radioIdx] = '\0';
+      char *hash = strchr(radioBuf, '#');
+      if (!hash){
+        Serial.print(F("[RADIO RX] frame missing #: ")); Serial.println(radioBuf);
+      } else {
+        size_t payloadLen = hash - radioBuf;
+        uint8_t expected = xor_checksum(radioBuf, payloadLen);
+        int hi = hex2byte(*(hash+1));
+        int lo = hex2byte(*(hash+2));
+        if (hi < 0 || lo < 0){
+          Serial.print(F("[RADIO RX] bad checksum text: ")); Serial.println(radioBuf);
+        } else {
+          uint8_t got = (hi<<4) | lo;
+          if (got != expected){
+            Serial.print(F("[RADIO RX] checksum mismatch, got ")); Serial.print(got, HEX);
+            Serial.print(F(" expected ")); Serial.println(expected, HEX);
+            radioSendFramed("NACK,CHK_ERR");
+          } else {
+            char payload[128];
+            memcpy(payload, radioBuf, payloadLen);
+            payload[payloadLen] = '\0';
+            Serial.print(F("[RADIO RX] payload OK: ")); Serial.println(payload);
+
+            double la, lo; long id;
+            if (parseGeoPayload(payload, la, lo, id)){
+              targetLat = la; targetLon = lo; targetId = id; hasTarget = true; retryCount = 0;
+              state = GOTO; stateStart = millis();
+              char ack[40]; snprintf(ack, sizeof(ack), "ACK,%ld,OK", id);
+              radioSendFramed(ack);
+              Serial.print(F("[ROVER] Target set: ")); Serial.print(la, 6); Serial.print(", "); Serial.println(lo, 6);
+            } else {
+              Serial.println(F("[RADIO RX] payload not GEO or bad format"));
+              radioSendFramed("NACK,BAD_FMT");
+            }
+          }
+        }
+      }
+      radioIdx = 0;
+    } else {
+      if (radioIdx < sizeof(radioBuf)-1){ radioBuf[radioIdx++] = c; }
+    }
+  }
+}
+
+void readGPS(){
+  while (gpsSS.available()){
+    gps.encode(gpsSS.read());
+  }
+}
+
+double currentLat(){ return gps.location.isValid() ? gps.location.lat() : NAN; }
+double currentLon(){ return gps.location.isValid() ? gps.location.lng() : NAN; }
+
+void sendTelemetry(double lat, double lon, double dist){
+  char t[120];
+  const char *ststr = "IDLE";
+  switch(state){ case IDLE: ststr="IDLE"; break; case GOTO: ststr="GOTO"; break; case ARRIVED: ststr="ARRIVED"; break; case COLLECT_FRONT: ststr="COLLECT"; break; case FORWARD_WITH_BACK_PUMP: ststr="BACKDRIVE"; break; case DONE: ststr="DONE"; break; }
+  if (!isnan(lat) && !isnan(lon)){
+    snprintf(t, sizeof(t), "TELEM,%.6f,%.6f,%.1f,%s,%ld", lat, lon, dist, ststr, targetId);
+  } else {
+    snprintf(t, sizeof(t), "TELEM,NaN,NaN,%.1f,%s,%ld", dist, ststr, targetId);
+  }
+  Serial.print(F("[TELEM] ")); Serial.println(t);
+  radioSendFramed(t);
+}
+
+void setup(){
+  pinMode(PUMP_FRONT_PIN, OUTPUT);
+  pinMode(PUMP_BACK_PIN, OUTPUT);
+#if defined(INPUT_PULLDOWN)
+  pinMode(COLLECT_DONE_PIN, INPUT_PULLDOWN);
+#else
+  pinMode(COLLECT_DONE_PIN, INPUT);
+#endif
+  pinMode(MOTOR_L_FWD, OUTPUT); pinMode(MOTOR_L_REV, OUTPUT);
+  pinMode(MOTOR_R_FWD, OUTPUT); pinMode(MOTOR_R_REV, OUTPUT);
+  drive_stop(); pump_front(false); pump_back(false);
+
+  Serial.begin(115200);
+  delay(100);
+  gpsSS.begin(9600);
+  radio.begin(9600);
+
+  Serial.println(F("[ROVER] Ready (with framed radio & retries)"));
+}
+
+void loop(){
+  readRadio();
+  readGPS();
+
+  double lat = currentLat();
+  double lon = currentLon();
+  double dist = NAN;
+  if (hasTarget && !isnan(lat) && !isnan(lon)) dist = haversine_m(lat, lon, targetLat, targetLon);
+
+  if (millis() - lastTelemetrySent > TELEMETRY_MS){
+    sendTelemetry(lat, lon, isnan(dist) ? -1.0 : dist);
+    lastTelemetrySent = millis();
+  }
+
+  switch (state){
+    case IDLE:
+      drive_stop(); pump_front(false); pump_back(false);
+      break;
+
+    case GOTO:
+      if (!hasTarget){ drive_stop(); state = IDLE; break; }
+      if (isnan(lat) || isnan(lon)) { drive_stop(); break; }
+      if (!isnan(dist) && dist <= ARRIVE_RADIUS_M){
+        drive_stop(); state = ARRIVED; stateStart = millis();
+        Serial.println(F("[ROVER] Arrived at target"));
+      } else {
+        if (millis() - stateStart > GOTO_TIMEOUT_MS){
+          retryCount++;
+          Serial.print(F("[ROVER] GOTO timeout (retry ")); Serial.print(retryCount); Serial.println(F(")"));
+          char errMsg[64]; snprintf(errMsg, sizeof(errMsg), "ERR,%ld,TIMEOUT", targetId);
+          radioSendFramed(errMsg);
+          if (retryCount <= MAX_RETRIES){
+            char req[40]; snprintf(req, sizeof(req), "REQRESEND,%ld", targetId);
+            radioSendFramed(req);
+            state = IDLE; hasTarget = false;
+          } else {
+            Serial.println(F("[ROVER] Giving up on target"));
+            state = IDLE; hasTarget = false; retryCount = 0;
+          }
+          drive_stop();
+        } else {
+          drive_forward();
+        }
+      }
+      break;
+
+    case ARRIVED:
+      if (millis() - stateStart > 1000){
+        state = COLLECT_FRONT; stateStart = millis();
+        pump_front(true);
+        Serial.println(F("[ROVER] Front pump ON"));
+        char s[64]; snprintf(s, sizeof(s), "STATUS,%ld,START_COLLECT", targetId);
+        radioSendFramed(s);
+      }
+      break;
+
+    case COLLECT_FRONT:
+      if (digitalRead(COLLECT_DONE_PIN) == HIGH || (millis() - stateStart > FRONT_PUMP_TIMEOUT_MS)){
+        pump_front(false);
+        Serial.println(F("[ROVER] Front pump OFF (collection done)"));
+        pump_back(true);
+        drive_forward();
+        state = FORWARD_WITH_BACK_PUMP; stateStart = millis();
+        char s[64]; snprintf(s, sizeof(s), "STATUS,%ld,START_BACK_DRAIN", targetId);
+        radioSendFramed(s);
+      }
+      break;
+
+    case FORWARD_WITH_BACK_PUMP:
+      if (millis() - stateStart > BACK_PUMP_DRIVE_MS){
+        drive_stop(); pump_back(false);
+        state = DONE; Serial.println(F("[ROVER] Back pump OFF, mission DONE"));
+        char s[64]; snprintf(s, sizeof(s), "STATUS,%ld,DONE", targetId);
+        radioSendFramed(s);
+      }
+      break;
+
+    case DONE:
+      if (millis() - stateStart > 10000){
+        Serial.println(F("[ROVER] Reset to IDLE"));
+        state = IDLE; hasTarget = false; targetId = -1; retryCount = 0;
+      }
+      break;
+  }
+}
