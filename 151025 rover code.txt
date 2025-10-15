@@ -1,3 +1,8 @@
+// rover_firmware_with_radio_ack.ino
+// Rover firmware (Arduino) - updated CONF_THRESHOLD to 0.75 (75%)
+// Controls motors, pumps; receives GEO messages framed with XOR checksum;
+// parses GEO,<lat>,<lon>,<confidence>#CHK and acts only if confidence >= 0.75
+// Sends TELEM periodically and ACKs alignment when target accepted.
 
 #include <TinyGPSPlus.h>
 #include <SoftwareSerial.h>
@@ -22,7 +27,10 @@ const unsigned long BACK_PUMP_MS  = 8000UL;   // back pump 8s
 const unsigned long TELEMETRY_MS  = 5000UL;
 const unsigned long GOTO_TIMEOUT_MS = 5 * 60 * 1000UL;
 const double ARRIVE_RADIUS_M = 2.0;  // stop within 2 meters
-const double CONF_THRESHOLD = 0.6;
+
+// <-- CHANGED: confidence threshold set to 0.75 (75%) -->
+const double CONF_THRESHOLD = 0.75;
+
 const int DRIVE_PWM = 150;
 const int TURN_PWM = 140;
 const double BEARING_TOLERANCE = 15.0; // degrees
@@ -143,6 +151,7 @@ void readRadio(){
       size_t len = hash - buf;
       uint8_t expected = xor_checksum(buf, len);
       int hi = hex2byte(*(hash+1)), lo = hex2byte(*(hash+2));
+      if (hi < 0 || lo < 0) return;
       uint8_t got = (hi<<4)|lo;
       if (expected != got) return;
 
