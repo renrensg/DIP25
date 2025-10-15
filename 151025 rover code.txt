@@ -1,0 +1,310 @@
+
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+#include <math.h>
+
+// ====== Serial setup ======
+SoftwareSerial gpsSS(2, 3);   // GPS RX=2, TX=3
+SoftwareSerial radio(4, 8);   // HC-12 RX=4, TX=8
+TinyGPSPlus gps;
+
+// ====== Pins ======
+const int PUMP_FRONT_PIN = 6;
+const int PUMP_BACK_PIN  = 7;
+const int MOTOR_L_FWD = 9;
+const int MOTOR_L_REV = 10;
+const int MOTOR_R_FWD = 11;
+const int MOTOR_R_REV = 12;
+
+// ====== Constants ======
+const unsigned long FRONT_PUMP_MS = 20000UL;  // front pump 20s
+const unsigned long BACK_PUMP_MS  = 8000UL;   // back pump 8s
+const unsigned long TELEMETRY_MS  = 5000UL;
+const unsigned long GOTO_TIMEOUT_MS = 5 * 60 * 1000UL;
+const double ARRIVE_RADIUS_M = 2.0;  // stop within 2 meters
+const double CONF_THRESHOLD = 0.6;
+const int DRIVE_PWM = 150;
+const int TURN_PWM = 140;
+const double BEARING_TOLERANCE = 15.0; // degrees
+
+// ====== State machine ======
+enum State { IDLE, ALIGN, GOTO, FRONT_PUMP, BACK_PUMP, DONE, REVERSE };
+State state = IDLE;
+unsigned long stateStart = 0;
+bool active = false;
+
+// ====== Mission data ======
+double targetLat = 0.0, targetLon = 0.0, targetConf = 0.0;
+bool hasTarget = false;
+double prevLat = NAN, prevLon = NAN;
+unsigned long lastTelemetrySent = 0;
+
+// ====== Math helpers ======
+static double toRad(double d){ return d * M_PI / 180.0; }
+static double toDeg(double r){ return r * 180.0 / M_PI; }
+
+double haversine_m(double lat1, double lon1, double lat2, double lon2){
+  double dLat = toRad(lat2 - lat1);
+  double dLon = toRad(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) +
+             cos(toRad(lat1))*cos(toRad(lat2))*sin(dLon/2)*sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return 6371000.0 * c;
+}
+
+// Bearing between two GPS points
+double bearing_deg(double lat1, double lon1, double lat2, double lon2){
+  double dLon = toRad(lon2 - lon1);
+  double y = sin(dLon) * cos(toRad(lat2));
+  double x = cos(toRad(lat1)) * sin(toRad(lat2)) -
+             sin(toRad(lat1)) * cos(toRad(lat2)) * cos(dLon);
+  double brng = atan2(y, x);
+  brng = toDeg(brng);
+  return fmod((brng + 360.0), 360.0); // 0–360 degrees
+}
+
+// ====== Motor Control ======
+void drive_stop(){
+  analogWrite(MOTOR_L_FWD, 0); analogWrite(MOTOR_L_REV, 0);
+  analogWrite(MOTOR_R_FWD, 0); analogWrite(MOTOR_R_REV, 0);
+}
+void drive_forward(int pwm = DRIVE_PWM){
+  analogWrite(MOTOR_L_FWD, pwm); analogWrite(MOTOR_L_REV, 0);
+  analogWrite(MOTOR_R_FWD, pwm); analogWrite(MOTOR_R_REV, 0);
+}
+void drive_backward(int pwm = DRIVE_PWM){
+  analogWrite(MOTOR_L_FWD, 0); analogWrite(MOTOR_L_REV, pwm);
+  analogWrite(MOTOR_R_FWD, 0); analogWrite(MOTOR_R_REV, pwm);
+}
+void turn_left(int pwm = TURN_PWM){
+  analogWrite(MOTOR_L_FWD, 0); analogWrite(MOTOR_L_REV, pwm);
+  analogWrite(MOTOR_R_FWD, pwm); analogWrite(MOTOR_R_REV, 0);
+}
+void turn_right(int pwm = TURN_PWM){
+  analogWrite(MOTOR_L_FWD, pwm); analogWrite(MOTOR_L_REV, 0);
+  analogWrite(MOTOR_R_FWD, 0); analogWrite(MOTOR_R_REV, pwm);
+}
+void pump_front(bool on){ digitalWrite(PUMP_FRONT_PIN, on ? HIGH : LOW); }
+void pump_back (bool on){ digitalWrite(PUMP_BACK_PIN,  on ? HIGH : LOW); }
+void stop_all(){ drive_stop(); pump_front(false); pump_back(false); }
+
+// ====== Checksum helpers ======
+uint8_t xor_checksum(const char *buf, size_t len){
+  uint8_t chk = 0;
+  for (size_t i=0;i<len;i++) chk ^= (uint8_t)buf[i];
+  return chk;
+}
+int hex2byte(char h){
+  if (h >= '0' && h <= '9') return h - '0';
+  if (h >= 'A' && h <= 'F') return 10 + (h - 'A');
+  if (h >= 'a' && h <= 'f') return 10 + (h - 'a');
+  return -1;
+}
+void radioSendFramed(const char *payload){
+  char frame[120];
+  size_t n = snprintf(frame, sizeof(frame), "%s", payload);
+  uint8_t chk = xor_checksum(frame, n);
+  char hex[6];
+  snprintf(hex, sizeof(hex), "#%02X\n", chk);
+  strncat(frame, hex, sizeof(frame)-strlen(frame)-1);
+  radio.print(frame);
+  Serial.print(F("[RADIO TX] ")); Serial.println(frame);
+}
+
+// ====== Parse GEO message ======
+bool parseGeoConf(const char *payload, double &lat, double &lon, double &conf){
+  if (strncmp(payload, "GEO,", 4) != 0) return false;
+  char tmp[80];
+  strncpy(tmp, payload+4, sizeof(tmp)-1);
+  tmp[sizeof(tmp)-1] = '\0';
+  char *p1 = strchr(tmp, ',');
+  if (!p1) return false; *p1 = '\0';
+  char *p2 = strchr(p1+1, ',');
+  if (!p2) return false; *p2 = '\0';
+  lat = strtod(tmp, nullptr);
+  lon = strtod(p1+1, nullptr);
+  conf = strtod(p2+1, nullptr);
+  return true;
+}
+
+// ====== Radio Receive ======
+void readRadio(){
+  static char buf[128];
+  static size_t idx = 0;
+  while (radio.available()){
+    char c = radio.read();
+    if (c == '\r') continue;
+    if (c == '\n'){
+      buf[idx] = '\0';
+      idx = 0;
+
+      char *hash = strchr(buf, '#');
+      if (!hash) return;
+      size_t len = hash - buf;
+      uint8_t expected = xor_checksum(buf, len);
+      int hi = hex2byte(*(hash+1)), lo = hex2byte(*(hash+2));
+      uint8_t got = (hi<<4)|lo;
+      if (expected != got) return;
+
+      double la, lo_, conf;
+      if (parseGeoConf(buf, la, lo_, conf)){
+        targetLat = la; targetLon = lo_; targetConf = conf;
+        hasTarget = true;
+        if (conf >= CONF_THRESHOLD){
+          state = ALIGN;
+          active = true;
+          stateStart = millis();
+          Serial.println(F("[ROVER] Target received → ALIGNING"));
+          radioSendFramed("ACK,ALIGN");
+        } else {
+          Serial.println(F("[ROVER] Low confidence — ignoring"));
+        }
+      }
+    } else {
+      if (idx < sizeof(buf)-1) buf[idx++] = c;
+    }
+  }
+}
+
+// ====== GPS reading ======
+void readGPS(){ while (gpsSS.available()) gps.encode(gpsSS.read()); }
+double currentLat(){ return gps.location.isValid() ? gps.location.lat() : NAN; }
+double currentLon(){ return gps.location.isValid() ? gps.location.lng() : NAN; }
+
+// ====== Telemetry ======
+void sendTelemetry(double lat, double lon, double dist){
+  char msg[120];
+  snprintf(msg, sizeof(msg), "TELEM,%.6f,%.6f,%.1f,%.2f,%s",
+           lat, lon, dist, targetConf,
+           state == IDLE ? "IDLE" :
+           state == ALIGN ? "ALIGN" :
+           state == GOTO ? "GOTO" :
+           state == FRONT_PUMP ? "FRONT" :
+           state == BACK_PUMP ? "BACK" :
+           state == REVERSE ? "REVERSE" : "DONE");
+  radioSendFramed(msg);
+}
+
+// ====== Setup ======
+void setup(){
+  pinMode(PUMP_FRONT_PIN, OUTPUT);
+  pinMode(PUMP_BACK_PIN, OUTPUT);
+  pinMode(MOTOR_L_FWD, OUTPUT);
+  pinMode(MOTOR_L_REV, OUTPUT);
+  pinMode(MOTOR_R_FWD, OUTPUT);
+  pinMode(MOTOR_R_REV, OUTPUT);
+  stop_all();
+  Serial.begin(115200);
+  gpsSS.begin(9600);
+  radio.begin(9600);
+  Serial.println(F("[ROVER] Ready — forward/backward turning mode"));
+}
+
+// ====== Main Loop ======
+void loop(){
+  readRadio();
+  readGPS();
+
+  double lat = currentLat();
+  double lon = currentLon();
+  double dist = NAN;
+  if (hasTarget && !isnan(lat) && !isnan(lon))
+    dist = haversine_m(lat, lon, targetLat, targetLon);
+
+  if (millis() - lastTelemetrySent > TELEMETRY_MS){
+    sendTelemetry(lat, lon, isnan(dist)?-1:dist);
+    lastTelemetrySent = millis();
+  }
+
+  if (!active || isnan(lat) || isnan(lon)) return;
+
+  double heading = NAN;
+  if (!isnan(prevLat) && !isnan(prevLon))
+    heading = bearing_deg(prevLat, prevLon, lat, lon);
+  prevLat = lat; prevLon = lon;
+
+  double targetBearing = bearing_deg(lat, lon, targetLat, targetLon);
+
+  switch(state){
+    case ALIGN: {
+      if (isnan(heading)){
+        drive_forward();
+        delay(1000);
+        drive_stop();
+        break;
+      }
+      double diff = targetBearing - heading;
+      if (diff > 180) diff -= 360;
+      if (diff < -180) diff += 360;
+
+      if (fabs(diff) <= BEARING_TOLERANCE){
+        drive_stop();
+        state = GOTO;
+        Serial.println(F("[ROVER] Aligned — moving toward target"));
+      } else if (diff > 0){
+        turn_right();
+      } else {
+        turn_left();
+      }
+      break;
+    }
+
+    case GOTO:
+      if (dist <= ARRIVE_RADIUS_M){
+        stop_all();
+        pump_front(true);
+        state = FRONT_PUMP;
+        stateStart = millis();
+        Serial.println(F("[ROVER] Arrived — front pump ON"));
+      } else if (dist > 10.0) {
+        // If overshoot or moving away — reverse
+        drive_backward();
+        state = REVERSE;
+        stateStart = millis();
+        Serial.println(F("[ROVER] Overshoot detected — reversing"));
+      } else {
+        drive_forward();
+      }
+      break;
+
+    case REVERSE:
+      if (millis() - stateStart > 3000){ // reverse 3s then stop
+        drive_stop();
+        state = ALIGN;
+        Serial.println(F("[ROVER] Reverse complete → realign"));
+      }
+      break;
+
+    case FRONT_PUMP:
+      if (millis() - stateStart > FRONT_PUMP_MS){
+        pump_front(false);
+        pump_back(true);
+        state = BACK_PUMP;
+        stateStart = millis();
+        Serial.println(F("[ROVER] Switching to back pump"));
+      }
+      break;
+
+    case BACK_PUMP:
+      if (millis() - stateStart > BACK_PUMP_MS){
+        stop_all();
+        state = DONE;
+        stateStart = millis();
+        Serial.println(F("[ROVER] Pump cycle complete"));
+      }
+      break;
+
+    case DONE:
+      if (millis() - stateStart > 5000){
+        state = IDLE;
+        active = false;
+        hasTarget = false;
+        Serial.println(F("[ROVER] Reset to IDLE"));
+      }
+      break;
+
+    case IDLE: default:
+      stop_all();
+      break;
+  }
+}
