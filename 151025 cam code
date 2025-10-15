@@ -1,0 +1,103 @@
+import cv2
+import requests
+import serial
+import time
+import pynmea2
+
+# === CONFIGURATION ===
+ROBOFLOW_API_KEY = "YOUR_API_KEY_HERE"
+ROBOFLOW_MODEL_ENDPOINT = "https://detect.roboflow.com/stagnant-water/1"
+HC12_PORT = "/dev/ttyUSB0"      # change if needed (HC-12)
+GPS_PORT = "/dev/ttyUSB1"       # change if needed (GPS)
+BAUD = 9600
+CONF_THRESHOLD = 0.6
+SEND_INTERVAL = 10              # seconds between coordinate sends
+
+# === INITIALIZE SERIAL LINKS ===
+hc12 = serial.Serial(HC12_PORT, BAUD, timeout=1)
+gps_serial = serial.Serial(GPS_PORT, BAUD, timeout=1)
+print("[Pi] HC-12 and GPS connected")
+
+# === CAMERA SETUP ===
+cam = cv2.VideoCapture(0)
+if not cam.isOpened():
+    raise RuntimeError("Camera not found")
+
+# === CHECKSUM CALCULATION ===
+def xor_checksum(s):
+    chk = 0
+    for c in s:
+        chk ^= ord(c)
+    return f"#{chk:02X}\n"
+
+# === GPS READING FUNCTION ===
+def get_gps_live():
+    """
+    Continuously read from GPS serial until a valid GGA/RMC sentence gives a fix.
+    Returns (lat, lon) as floats.
+    """
+    while True:
+        line = gps_serial.readline().decode(errors="ignore").strip()
+        if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
+            try:
+                msg = pynmea2.parse(line)
+                if hasattr(msg, 'latitude') and hasattr(msg, 'longitude'):
+                    if msg.latitude != 0 and msg.longitude != 0:
+                        return (msg.latitude, msg.longitude)
+            except pynmea2.ParseError:
+                continue
+
+# === SEND GEO COMMAND TO ARDUINO ROVER ===
+def send_geo(lat, lon, ident):
+    payload = f"GEO,{lat:.6f},{lon:.6f},{ident}"
+    frame = payload + xor_checksum(payload)
+    hc12.write(frame.encode())
+    print(f"[Pi → Rover] {frame.strip()}")
+
+# === MAIN LOOP ===
+frame_id = 0
+last_sent = 0
+
+while True:
+    ret, frame = cam.read()
+    if not ret:
+        print("[Pi] Camera read failed")
+        continue
+
+    # Convert to JPEG
+    _, buf = cv2.imencode(".jpg", frame)
+
+    # Call Roboflow API
+    try:
+        res = requests.post(
+            f"{ROBOFLOW_MODEL_ENDPOINT}?api_key={ROBOFLOW_API_KEY}",
+            files={"file": ("frame.jpg", buf.tobytes(), "image/jpeg")},
+            data={"name": f"frame_{frame_id}"},
+            timeout=10
+        )
+    except requests.exceptions.RequestException as e:
+        print("[Pi] Roboflow error:", e)
+        time.sleep(2)
+        continue
+
+    if res.status_code != 200:
+        print("[Pi] Roboflow API returned:", res.text)
+        time.sleep(2)
+        continue
+
+    detections = res.json().get("predictions", [])
+    stagnant = any(
+        d["class"].lower().startswith("stagnant") and d["confidence"] > CONF_THRESHOLD
+        for d in detections
+    )
+
+    if stagnant and (time.time() - last_sent > SEND_INTERVAL):
+        lat, lon = get_gps_live()
+        print(f"[Pi] Stagnant water detected at GPS ({lat:.6f}, {lon:.6f})")
+        send_geo(lat, lon, frame_id)
+        last_sent = time.time()
+    else:
+        print("[Pi] No stagnant water detected")
+
+    frame_id += 1
+    time.sleep(2)
