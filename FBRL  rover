@@ -1,0 +1,95 @@
+// ===== Galaxy RVR 6-Motor (3 per side) Test =====
+// Tests Forward, Backward, Right, Left motions for 5 seconds each
+
+// --- Motor driver pins (grouped by side) ---
+// Left side motors (L1, L2, L3)
+const int LEFT_FWD = 9;
+const int LEFT_REV = 10;
+
+// Right side motors (R1, R2, R3)
+const int RIGHT_FWD = 11;
+const int RIGHT_REV = 12;
+
+// --- Speed and timing ---
+const int SPEED = 200;       // PWM speed (0–255)
+const int DELAY_TIME = 5000; // 5 seconds per movement
+
+// --- Motion helper functions ---
+void stopMotors() {
+  analogWrite(LEFT_FWD, 0);
+  analogWrite(LEFT_REV, 0);
+  analogWrite(RIGHT_FWD, 0);
+  analogWrite(RIGHT_REV, 0);
+}
+
+void moveForward() {
+  analogWrite(LEFT_FWD, SPEED);
+  analogWrite(LEFT_REV, 0);
+  analogWrite(RIGHT_FWD, SPEED);
+  analogWrite(RIGHT_REV, 0);
+  Serial.println("Moving FORWARD");
+}
+
+void moveBackward() {
+  analogWrite(LEFT_FWD, 0);
+  analogWrite(LEFT_REV, SPEED);
+  analogWrite(RIGHT_FWD, 0);
+  analogWrite(RIGHT_REV, SPEED);
+  Serial.println("Moving BACKWARD");
+}
+
+void turnRight() {
+  analogWrite(LEFT_FWD, SPEED);
+  analogWrite(LEFT_REV, 0);
+  analogWrite(RIGHT_FWD, 0);
+  analogWrite(RIGHT_REV, SPEED);
+  Serial.println("Turning RIGHT");
+}
+
+void turnLeft() {
+  analogWrite(LEFT_FWD, 0);
+  analogWrite(LEFT_REV, SPEED);
+  analogWrite(RIGHT_FWD, SPEED);
+  analogWrite(RIGHT_REV, 0);
+  Serial.println("Turning LEFT");
+}
+
+// --- Setup ---
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LEFT_FWD, OUTPUT);
+  pinMode(LEFT_REV, OUTPUT);
+  pinMode(RIGHT_FWD, OUTPUT);
+  pinMode(RIGHT_REV, OUTPUT);
+
+  stopMotors();
+  Serial.println("=== Galaxy RVR 6-Motor (Grouped) Test ===");
+  delay(2000);
+}
+
+// --- Main Loop ---
+void loop() {
+  moveForward();
+  delay(DELAY_TIME);
+  stopMotors();
+  delay(1000);
+
+  moveBackward();
+  delay(DELAY_TIME);
+  stopMotors();
+  delay(1000);
+
+  turnRight();
+  delay(DELAY_TIME);
+  stopMotors();
+  delay(1000);
+
+  turnLeft();
+  delay(DELAY_TIME);
+  stopMotors();
+  delay(1000);
+
+  Serial.println("Cycle complete. Restarting in 3s...");
+  delay(3000);
+}
