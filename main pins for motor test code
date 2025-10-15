@@ -1,0 +1,36 @@
+// ===== L298N rover demo =====
+const int IN1=5, IN2=6, ENA=7;     // Left
+const int IN3=1, IN4=2, ENB=3;    // Right
+int SPEED = 180;
+
+void setup(){
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(ENA,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT); pinMode(ENB,OUTPUT);
+}
+
+void leftMotor(int pwm){
+  if (pwm >= 0){ digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW); }
+  else         { digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); pwm = -pwm; }
+  analogWrite(ENA, constrain(pwm,0,255));
+}
+
+void rightMotor(int pwm){
+  if (pwm >= 0){ digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW); }
+  else         { digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH); pwm = -pwm; }
+  analogWrite(ENB, constrain(pwm,0,255));
+}
+
+void forward(int sp=SPEED){ leftMotor(sp); rightMotor(sp); }
+void backward(int sp=SPEED){ leftMotor(-sp); rightMotor(-sp); }
+void left(int sp=SPEED){ leftMotor(-sp); rightMotor(sp); }
+void right(int sp=SPEED){ leftMotor(sp); rightMotor(-sp); }
+void stop(){ leftMotor(0); rightMotor(0); }
+
+void loop(){
+  forward();  delay(1500);
+  stop();     delay(400);
+  right(150); delay(700);
+  stop();     delay(300);
+  backward(180); delay(1000);
+  stop();     delay(1000);
+}
