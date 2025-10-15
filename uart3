@@ -1,0 +1,11 @@
+# 1. Backup your config just in case
+sudo cp /boot/config.txt /boot/config_backup.txt
+
+# 2. Enable UART3 overlay
+echo "dtoverlay=uart3" | sudo tee -a /boot/config.txt
+
+# 3. Disable serial console (if enabled)
+sudo raspi-config nonint do_serial 1 0
+
+# 4. Reboot to apply changes
+sudo reboot
