@@ -1,0 +1,32 @@
+// --- Pin Setup ---
+#define RELAY1 6   // Relay channel 1 (Pump 1)
+#define RELAY2 7   // Relay channel 2 (Pump 2)
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+
+  // Ensure both relays OFF initially
+  digitalWrite(RELAY1, HIGH);   // Relay HIGH = OFF for most modules
+  digitalWrite(RELAY2, HIGH);
+
+  Serial.println("System ready: alternating pumps every 10 seconds...");
+}
+
+void loop() {
+  // --- Run Pump 1 ---
+  Serial.println("Pump 1 ON");
+  digitalWrite(RELAY1, LOW);    // LOW = relay ON
+  digitalWrite(RELAY2, HIGH);   // Ensure Pump 2 is OFF
+  delay(10000);                 // 10 seconds
+  digitalWrite(RELAY1, HIGH);   // Turn OFF Pump 1
+
+  // --- Run Pump 2 ---
+  Serial.println("Pump 2 ON");
+  digitalWrite(RELAY2, LOW);    // LOW = relay ON
+  delay(10000);                 // 10 seconds
+  digitalWrite(RELAY2, HIGH);   // Turn OFF Pump 2
+
+  // Loop repeats
+}
