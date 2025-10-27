@@ -1,0 +1,24 @@
+const int pump1Pin = 6;
+const int pump2Pin = 7;
+
+void setup() {
+  pinMode(pump1Pin, OUTPUT);
+  pinMode(pump2Pin, OUTPUT);
+
+  digitalWrite(pump1Pin, HIGH);
+  digitalWrite(pump2Pin, HIGH);
+  delay(2000);
+
+  // turn ON only pump1
+  digitalWrite(pump1Pin, LOW);
+  delay(3000);
+  digitalWrite(pump1Pin, HIGH);
+  delay(2000);
+
+  // turn ON only pump2
+  digitalWrite(pump2Pin, LOW);
+  delay(3000);
+  digitalWrite(pump2Pin, HIGH);
+}
+
+void loop() {}
