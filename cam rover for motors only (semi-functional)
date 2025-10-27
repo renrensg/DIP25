@@ -1,0 +1,75 @@
+#include <SoftwareSerial.h>
+#include <Arduino.h>
+#include <SoftPWM.h>
+
+SoftwareSerial hc12(10, 11); // RX, TX for HC-12
+
+// Motor driver pins (adjust if different on your Galaxy shield)
+const int in1 = 2;
+const int in2 = 3;
+const int in3 = 4;
+const int in4 = 5;
+
+void setup() {
+  // Set motor pins as outputs
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+  // Start serials
+  Serial.begin(9600);   // For debugging via USB
+  hc12.begin(9600);     // For HC-12 wireless comms
+
+  Serial.println("🚗 Rover ready and listening for HC-12 signal...");
+}
+
+void loop() {
+  // Check if HC-12 received anything
+  if (hc12.available()) {
+    String msg = hc12.readStringUntil('\n');
+    //optional msg.trim();
+    Serial.print("📩 Received via HC-12: ");
+    Serial.println(msg);
+
+    // If message is "MOVE" → move forward for 5 seconds
+    if (msg.equalsIgnoreCase("MOVE")) {
+      Serial.println("✅ Command received: MOVE — moving forward...");
+      moveForward(200);
+      delay(5000);
+      stopMove();
+      Serial.println("🛑 Movement complete.");
+    }
+  }
+}
+//original moveForward code 
+/*void moveForward() {
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH);
+  digitalWrite(in4, LOW);*/
+}
+void moveForward(int speed) {
+  // Set the left motors rotate counterclockwise
+  SoftPWMSet(in1, speed);
+  SoftPWMSet(in2, 0);
+
+  // Set the right motors rotate clockwise
+  SoftPWMSet(in3, 0);
+  SoftPWMSet(in4, speed);
+}
+//original stopMove code
+/* void stopMove() {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+}*/
+
+void stopMove() {
+  // Stop all the motors
+  SoftPWMSet(in1, 0);
+  SoftPWMSet(in2, 0);
+  SoftPWMSet(in3, 0);
+  SoftPWMSet(in4, 0);
+}
