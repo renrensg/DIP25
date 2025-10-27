@@ -1,0 +1,79 @@
+#include <SoftwareSerial.h>
+#include <Arduino.h>
+
+SoftwareSerial HC12(10, 11); //RXTX
+// Motor driver pins
+void setup() {
+  Serial.begin(9600);
+  HC12.begin(9600);
+  Serial.println("Listening for HC-12 messages...");
+const int in1 = 2;
+const int in2 = 3;
+const int in3 = 4;
+const int in4 = 5;
+
+// Pump relays (active LOW if 5V relay)
+const int RELAY1 = 6;   // pump 1 (collect)
+const int RELAY2 = 7;   // pump 2 (spray)
+
+void setup() {
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+
+  digitalWrite(RELAY1, HIGH);
+  digitalWrite(RELAY2, HIGH);
+
+  Serial.begin(9600);
+  Serial.println("Rover ready, waiting for signal...");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "START") {
+      Serial.println("Signal received — moving forward...");
+
+      // move forward for 5 s
+      moveForward(5);
+
+      // turn on pump 1 for 5 s (collect)
+      digitalWrite(RELAY1, LOW);
+      delay(5000);
+      digitalWrite(RELAY1, HIGH);
+
+      // move forward again for 5 s
+      moveForward(5);
+
+      // turn on pump 2 for 5 s (spray)
+      digitalWrite(RELAY2, LOW);
+      delay(5000);
+      digitalWrite(RELAY2, HIGH);
+
+      stopMove();
+      Serial.println("Sequence done.");
+    }
+  }
+}
+
+void moveForward(int seconds) {
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, HIGH);
+  delay(seconds * 1000);
+  stopMove();
+}
+
+void stopMove() {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+}
