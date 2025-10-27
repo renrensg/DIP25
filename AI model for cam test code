@@ -1,0 +1,20 @@
+import requests
+import cv2
+
+# ---- Configuration ----
+api_key = "QPvOtupMs6QJyX3m9VU7"
+project = "demo-f3ivh"      # e.g. "water-detection"
+version = 1                        # change if needed
+image_path = "test.jpg"
+
+# ---- Read image ----
+img = cv2.imread(image_path)
+_, img_encoded = cv2.imencode('.jpg', img)
+
+# ---- Send to Roboflow API ----
+url = f"https://detect.roboflow.com/{project}/{version}?api_key={api_key}"
+response = requests.post(url, files={"file": img_encoded.tobytes()})
+
+# ---- Parse detections ----
+detections = response.json()
+print(detections)
