@@ -1,0 +1,66 @@
+// Pins
+const uint8_t RELAY_PUMP1 = 6;   // IN1
+const uint8_t RELAY_PUMP2 = 7;   // IN2
+
+// Set true if your relay is active-LOW (most cheap boards)
+const bool ACTIVE_LOW = true;
+
+// Helpers to map logical ON/OFF to pin level
+inline void setRelay(uint8_t pin, bool on) {
+  if (ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+void pump1On()  { setRelay(RELAY_PUMP1, true); }
+void pump1Off() { setRelay(RELAY_PUMP1, false); }
+void pump2On()  { setRelay(RELAY_PUMP2, true); }
+void pump2Off() { setRelay(RELAY_PUMP2, false); }
+
+void allOff() { pump1Off(); pump2Off(); }
+
+void setup() {
+  pinMode(RELAY_PUMP1, OUTPUT);
+  pinMode(RELAY_PUMP2, OUTPUT);
+
+  // Fail-safe: start with everything OFF
+  if (ACTIVE_LOW) { digitalWrite(RELAY_PUMP1, HIGH); digitalWrite(RELAY_PUMP2, HIGH); }
+  else            { digitalWrite(RELAY_PUMP1, LOW);  digitalWrite(RELAY_PUMP2, LOW);  }
+
+  Serial.begin(9600);
+  Serial.println("Pump controller ready. Commands: P1ON,P1OFF,P2ON,P2OFF,ALLON,ALLOFF, PULSE1 <ms>, PULSE2 <ms>");
+}
+
+void loop() {
+  // --- Example: timed automatic sequence (comment out if not needed) ---
+  // pump1On();  delay(3000);   // run Pump1 3s
+  // pump1Off(); delay(1000);
+  // pump2On();  delay(3000);   // run Pump2 3s
+  // pump2Off(); delay(2000);
+
+  // --- Serial command interface (for testing / integration) ---
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim(); cmd.toUpperCase();
+
+    if      (cmd == "P1ON")  { pump1On();  Serial.println("Pump1 ON"); }
+    else if (cmd == "P1OFF") { pump1Off(); Serial.println("Pump1 OFF"); }
+    else if (cmd == "P2ON")  { pump2On();  Serial.println("Pump2 ON"); }
+    else if (cmd == "P2OFF") { pump2Off(); Serial.println("Pump2 OFF"); }
+    else if (cmd == "ALLON") { pump1On(); pump2On(); Serial.println("Both ON"); }
+    else if (cmd == "ALLOFF"){ allOff();  Serial.println("Both OFF"); }
+    else if (cmd.startsWith("PULSE1 ")) {
+      unsigned long ms = cmd.substring(7).toInt();
+      pump1On(); delay(ms); pump1Off(); Serial.print("Pumped1 "); Serial.print(ms); Serial.println(" ms");
+    }
+    else if (cmd.startsWith("PULSE2 ")) {
+      unsigned long ms = cmd.substring(7).toInt();
+      pump2On(); delay(ms); pump2Off(); Serial.print("Pumped2 "); Serial.print(ms); Serial.println(" ms");
+    }
+    else {
+      Serial.println("Unknown cmd");
+    }
+  }
+}
