@@ -61,5 +61,7 @@ Completed end-to-end demo showing real-time stagnant-water detection feeding int
 
 The software team successfully built a complete AI-IoT pipeline, from training the model (on Roboflow) to integrating every hardware and communication module. By combining computer vision, GPS tracking, wireless UART communication and rover coordination, we delivered a fully functional prototype ready for field demonstration. The system is lightweight, reliable, and optimised for real-time deployment, which is a strong foundation for future expansion into our drone-based or multi-node monitoring networks.
 
+Stay tune for more updates! Nov 2025
+
 
 
